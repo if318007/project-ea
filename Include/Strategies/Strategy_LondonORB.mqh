@@ -1,7 +1,5 @@
-#ifndef STRATEGY_LONDON_ORB_MQH
-#define STRATEGY_LONDON_ORB_MQH
-
-#include "../EA_Core/Config.mqh"
+#pragma once
+#include "../EA_Core/Types.mqh"
 
 TradeSignal EvalLondonORB()
 {
@@ -35,5 +33,3 @@ TradeSignal EvalLondonORB()
    }
    return s;
 }
-
-#endif // STRATEGY_LONDON_ORB_MQH

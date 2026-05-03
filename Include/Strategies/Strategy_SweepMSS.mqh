@@ -1,7 +1,5 @@
-#ifndef STRATEGY_SWEEP_MSS_MQH
-#define STRATEGY_SWEEP_MSS_MQH
-
-#include "../EA_Core/Config.mqh"
+#pragma once
+#include "../EA_Core/Types.mqh"
 
 TradeSignal EvalSweepMSS()
 {
@@ -32,5 +30,3 @@ TradeSignal EvalSweepMSS()
    }
    return s;
 }
-
-#endif // STRATEGY_SWEEP_MSS_MQH

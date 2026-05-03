@@ -1,7 +1,5 @@
-#ifndef STRATEGY_EMA_PULLBACK_MQH
-#define STRATEGY_EMA_PULLBACK_MQH
-
-#include "../EA_Core/Config.mqh"
+#pragma once
+#include "../EA_Core/Types.mqh"
 
 TradeSignal EvalEMAPullback()
 {
@@ -35,5 +33,3 @@ TradeSignal EvalEMAPullback()
    }
    return s;
 }
-
-#endif // STRATEGY_EMA_PULLBACK_MQH
