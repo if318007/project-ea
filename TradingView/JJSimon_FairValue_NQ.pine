@@ -75,8 +75,8 @@ i_showMSBLabels   = input.bool(true, "Show MSB labels",                group=g_s
 // ---------- Displacement Candle --------------------------------------------
 g_disp = "4) Displacement Candle"
 i_atrLen          = input.int(14,    "ATR length",               minval=2, group=g_disp)
-i_bodyAtrMult     = input.float(1.0, "Min body / ATR multiplier", step=0.1, minval=0.1, group=g_disp)
-i_maxWickRatio    = input.float(0.2, "Max counter-wick / body ratio", step=0.05, minval=0.0, maxval=1.0, group=g_disp, tooltip="Counter wick is the wick beyond the close (against displacement direction).")
+i_bodyAtrMult     = input.float(0.5, "Min body / ATR multiplier", step=0.1, minval=0.1, group=g_disp, tooltip="On NQ 1m a body equal to ATR is rare. Default 0.5 = body must be at least half of ATR. Tighten to 1.0 for stricter A+ setups.")
+i_maxWickRatio    = input.float(0.35, "Max counter-wick / body ratio", step=0.05, minval=0.0, maxval=1.0, group=g_disp, tooltip="Counter wick is the wick beyond the close (against displacement direction). 0.35 = counter wick may be up to 35% of body. Spec is 0.2 but that almost never fires on 1m.")
 i_minCandleSize   = input.float(0.0, "Minimum candle range (points)", step=0.5, minval=0, group=g_disp)
 i_dispLookback    = input.int(5,    "Displacement lookback (bars)",   minval=0, maxval=20, group=g_disp, tooltip="How many bars back a displacement can be paired with the current BOS/MSB. 0 = same bar only.")
 i_markDisp        = input.bool(true, "Mark displacement candles",   group=g_disp)
@@ -86,10 +86,10 @@ i_highlightDisp   = input.bool(false,"Highlight displacement candle background",
 g_entry = "5) Entry Models"
 i_useContinuation = input.bool(true, "Enable continuation trades",           group=g_entry)
 i_useMeanRev      = input.bool(true, "Enable mean-reversion trades",         group=g_entry)
-i_minDistContATR  = input.float(0.5, "Continuation: min distance from FV (xATR)", step=0.1, minval=0, group=g_entry)
-i_minMomentumATR  = input.float(1.0, "Continuation: min displacement body (xATR)", step=0.1, minval=0, group=g_entry)
-i_meanRevATRMult  = input.float(2.0, "Mean reversion: min |Price - FV| / ATR", step=0.1, minval=0, group=g_entry)
-i_minExtPts       = input.float(20.0,"Mean reversion: min extension (points)", step=1.0, minval=0, group=g_entry)
+i_minDistContATR  = input.float(0.0, "Continuation: min distance from FV (xATR)", step=0.1, minval=0, group=g_entry)
+i_minMomentumATR  = input.float(0.5, "Continuation: min displacement body (xATR)", step=0.1, minval=0, group=g_entry)
+i_meanRevATRMult  = input.float(1.0, "Mean reversion: min |Price - FV| / ATR", step=0.1, minval=0, group=g_entry)
+i_minExtPts       = input.float(5.0, "Mean reversion: min extension (points)", step=1.0, minval=0, group=g_entry)
 i_debugMode       = input.bool(false,"DEBUG: bypass chop / distance / VWAP / trend filters", group=g_entry, tooltip="Use only to verify the script fires entries on your data. Leave OFF for live trading.")
 
 // ---------- VWAP ------------------------------------------------------------
@@ -122,9 +122,9 @@ i_trailPts        = input.float(15.0, "Trailing stop distance (points)",     ste
 
 // ---------- Chop Filter -----------------------------------------------------
 g_chop = "9) Chop Filter"
-i_minAtrPts       = input.float(3.0,  "Minimum ATR (points) to trade",          step=0.5, group=g_chop)
-i_minSessionExp   = input.float(15.0, "Minimum session range so far (points)",  step=1.0, group=g_chop)
-i_noTradeFVPts    = input.float(2.0,  "No-trade buffer around FV (points)",     step=0.5, group=g_chop)
+i_minAtrPts       = input.float(2.0,  "Minimum ATR (points) to trade",          step=0.5, group=g_chop)
+i_minSessionExp   = input.float(5.0,  "Minimum session range so far (points)",  step=1.0, group=g_chop)
+i_noTradeFVPts    = input.float(0.5,  "No-trade buffer around FV (points)",     step=0.5, group=g_chop)
 i_useTrendFilter  = input.bool(false, "Use 50-EMA slope as trend filter",       group=g_chop)
 
 // ---------- Visualisation ---------------------------------------------------
