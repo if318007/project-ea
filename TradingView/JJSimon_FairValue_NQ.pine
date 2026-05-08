@@ -395,33 +395,31 @@ flat             = strategy.position_size == 0
 distFromFV = na(currentFV) ? 0.0 : close - currentFV
 
 // --- Continuation: trend continues away from fair value ---
-contLong  = i_useContinuation and bullBOS and bullDisp and not na(currentFV)
-             and  distFromFV  >  i_minDistContATR * atr
-             and  body        >= i_minMomentumATR * atr
-             and (not i_useVwap or close > vwapVal)
+contDistFarLong   = distFromFV  > i_minDistContATR * atr
+contDistFarShort  = -distFromFV > i_minDistContATR * atr
+contMomentumOK    = body >= i_minMomentumATR * atr
+contVwapLongOK    = not i_useVwap or close > vwapVal
+contVwapShortOK   = not i_useVwap or close < vwapVal
 
-contShort = i_useContinuation and bearBOS and bearDisp and not na(currentFV)
-             and -distFromFV  >  i_minDistContATR * atr
-             and  body        >= i_minMomentumATR * atr
-             and (not i_useVwap or close < vwapVal)
+contLong  = i_useContinuation and bullBOS and bullDisp and not na(currentFV) and contDistFarLong  and contMomentumOK and contVwapLongOK
+contShort = i_useContinuation and bearBOS and bearDisp and not na(currentFV) and contDistFarShort and contMomentumOK and contVwapShortOK
 
 // --- Mean reversion: extended from FV, MSB confirms reversal ---
-mrLong  = i_useMeanRev and bullMSB and bullDisp and not na(currentFV)
-             and  -distFromFV >  i_meanRevATRMult * atr
-             and  -distFromFV >  i_minExtPts
-             and (not i_useVwap or close >= vwapVal or close >= ta.lowest(low, 3))
+mrExtAboveATR   = distFromFV  > i_meanRevATRMult * atr
+mrExtBelowATR   = -distFromFV > i_meanRevATRMult * atr
+mrExtAbovePts   = distFromFV  > i_minExtPts
+mrExtBelowPts   = -distFromFV > i_minExtPts
+mrVwapLongOK    = not i_useVwap or close >= vwapVal or close >= ta.lowest(low, 3)
+mrVwapShortOK   = not i_useVwap or close <= vwapVal or close <= ta.highest(high, 3)
 
-mrShort = i_useMeanRev and bearMSB and bearDisp and not na(currentFV)
-             and   distFromFV >  i_meanRevATRMult * atr
-             and   distFromFV >  i_minExtPts
-             and (not i_useVwap or close <= vwapVal or close <= ta.highest(high, 3))
+mrLong  = i_useMeanRev and bullMSB and bullDisp and not na(currentFV) and mrExtBelowATR and mrExtBelowPts and mrVwapLongOK
+mrShort = i_useMeanRev and bearMSB and bearDisp and not na(currentFV) and mrExtAboveATR and mrExtAbovePts and mrVwapShortOK
 
 // --- Combine into final long/short signals & gating ---
 longSignal_raw  = contLong  or mrLong
 shortSignal_raw = contShort or mrShort
 
-readyToTrade = symbolAllowed and inTradeWindow and chopGate and flat
-             and underTradeLimit and not cooldownActive and not dailyLossHit
+readyToTrade = symbolAllowed and inTradeWindow and chopGate and flat and underTradeLimit and not cooldownActive and not dailyLossHit
 
 longSignal  = readyToTrade and longSignal_raw  and canTakeLong  and trendFilterLong  and barstate.isconfirmed
 shortSignal = readyToTrade and shortSignal_raw and canTakeShort and trendFilterShort and barstate.isconfirmed
