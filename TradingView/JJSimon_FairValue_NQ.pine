@@ -78,6 +78,7 @@ i_atrLen          = input.int(14,    "ATR length",               minval=2, group
 i_bodyAtrMult     = input.float(1.0, "Min body / ATR multiplier", step=0.1, minval=0.1, group=g_disp)
 i_maxWickRatio    = input.float(0.2, "Max counter-wick / body ratio", step=0.05, minval=0.0, maxval=1.0, group=g_disp, tooltip="Counter wick is the wick beyond the close (against displacement direction).")
 i_minCandleSize   = input.float(0.0, "Minimum candle range (points)", step=0.5, minval=0, group=g_disp)
+i_dispLookback    = input.int(5,    "Displacement lookback (bars)",   minval=0, maxval=20, group=g_disp, tooltip="How many bars back a displacement can be paired with the current BOS/MSB. 0 = same bar only.")
 i_markDisp        = input.bool(true, "Mark displacement candles",   group=g_disp)
 i_highlightDisp   = input.bool(false,"Highlight displacement candle background", group=g_disp)
 
@@ -89,6 +90,7 @@ i_minDistContATR  = input.float(0.5, "Continuation: min distance from FV (xATR)"
 i_minMomentumATR  = input.float(1.0, "Continuation: min displacement body (xATR)", step=0.1, minval=0, group=g_entry)
 i_meanRevATRMult  = input.float(2.0, "Mean reversion: min |Price - FV| / ATR", step=0.1, minval=0, group=g_entry)
 i_minExtPts       = input.float(20.0,"Mean reversion: min extension (points)", step=1.0, minval=0, group=g_entry)
+i_debugMode       = input.bool(false,"DEBUG: bypass chop / distance / VWAP / trend filters", group=g_entry, tooltip="Use only to verify the script fires entries on your data. Leave OFF for live trading.")
 
 // ---------- VWAP ------------------------------------------------------------
 g_vwap = "6) VWAP Filter"
@@ -394,35 +396,48 @@ flat             = strategy.position_size == 0
 
 distFromFV = na(currentFV) ? 0.0 : close - currentFV
 
-// --- Continuation: trend continues away from fair value ---
-contDistFarLong   = distFromFV  > i_minDistContATR * atr
-contDistFarShort  = -distFromFV > i_minDistContATR * atr
-contMomentumOK    = body >= i_minMomentumATR * atr
-contVwapLongOK    = not i_useVwap or close > vwapVal
-contVwapShortOK   = not i_useVwap or close < vwapVal
+// Allow displacement to occur up to N bars before BOS/MSB (per JJ Simon spec the
+// displacement and the structure break are usually consecutive but not always
+// the same candle).  ta.barssince returns na if the condition was never true,
+// so guard with nz(..., 999).
+bullDispRecent = bullDisp or (i_dispLookback > 0 and nz(ta.barssince(bullDisp), 999) <= i_dispLookback)
+bearDispRecent = bearDisp or (i_dispLookback > 0 and nz(ta.barssince(bearDisp), 999) <= i_dispLookback)
 
-contLong  = i_useContinuation and bullBOS and bullDisp and not na(currentFV) and contDistFarLong  and contMomentumOK and contVwapLongOK
-contShort = i_useContinuation and bearBOS and bearDisp and not na(currentFV) and contDistFarShort and contMomentumOK and contVwapShortOK
+// --- Continuation: trend continues away from fair value ---
+contDistFarLong   = i_debugMode or distFromFV  > i_minDistContATR * atr
+contDistFarShort  = i_debugMode or -distFromFV > i_minDistContATR * atr
+contMomentumOK    = i_debugMode or body >= i_minMomentumATR * atr
+contVwapLongOK    = i_debugMode or not i_useVwap or close > vwapVal
+contVwapShortOK   = i_debugMode or not i_useVwap or close < vwapVal
+
+contLong  = i_useContinuation and bullBOS and bullDispRecent and not na(currentFV) and contDistFarLong  and contMomentumOK and contVwapLongOK
+contShort = i_useContinuation and bearBOS and bearDispRecent and not na(currentFV) and contDistFarShort and contMomentumOK and contVwapShortOK
 
 // --- Mean reversion: extended from FV, MSB confirms reversal ---
-mrExtAboveATR   = distFromFV  > i_meanRevATRMult * atr
-mrExtBelowATR   = -distFromFV > i_meanRevATRMult * atr
-mrExtAbovePts   = distFromFV  > i_minExtPts
-mrExtBelowPts   = -distFromFV > i_minExtPts
-mrVwapLongOK    = not i_useVwap or close >= vwapVal or close >= ta.lowest(low, 3)
-mrVwapShortOK   = not i_useVwap or close <= vwapVal or close <= ta.highest(high, 3)
+mrExtAboveATR   = i_debugMode or distFromFV  > i_meanRevATRMult * atr
+mrExtBelowATR   = i_debugMode or -distFromFV > i_meanRevATRMult * atr
+mrExtAbovePts   = i_debugMode or distFromFV  > i_minExtPts
+mrExtBelowPts   = i_debugMode or -distFromFV > i_minExtPts
+mrVwapLongOK    = i_debugMode or not i_useVwap or close >= vwapVal or close >= ta.lowest(low, 3)
+mrVwapShortOK   = i_debugMode or not i_useVwap or close <= vwapVal or close <= ta.highest(high, 3)
 
-mrLong  = i_useMeanRev and bullMSB and bullDisp and not na(currentFV) and mrExtBelowATR and mrExtBelowPts and mrVwapLongOK
-mrShort = i_useMeanRev and bearMSB and bearDisp and not na(currentFV) and mrExtAboveATR and mrExtAbovePts and mrVwapShortOK
+mrLong  = i_useMeanRev and bullMSB and bullDispRecent and not na(currentFV) and mrExtBelowATR and mrExtBelowPts and mrVwapLongOK
+mrShort = i_useMeanRev and bearMSB and bearDispRecent and not na(currentFV) and mrExtAboveATR and mrExtAbovePts and mrVwapShortOK
 
 // --- Combine into final long/short signals & gating ---
 longSignal_raw  = contLong  or mrLong
 shortSignal_raw = contShort or mrShort
 
-readyToTrade = symbolAllowed and inTradeWindow and chopGate and flat and underTradeLimit and not cooldownActive and not dailyLossHit
+// Chop / trend filters are also bypassed in debug mode so the user can see
+// raw setup frequency.
+chopOK_eff       = i_debugMode or chopGate
+trendLongOK_eff  = i_debugMode or trendFilterLong
+trendShortOK_eff = i_debugMode or trendFilterShort
 
-longSignal  = readyToTrade and longSignal_raw  and canTakeLong  and trendFilterLong  and barstate.isconfirmed
-shortSignal = readyToTrade and shortSignal_raw and canTakeShort and trendFilterShort and barstate.isconfirmed
+readyToTrade = symbolAllowed and inTradeWindow and chopOK_eff and flat and underTradeLimit and not cooldownActive and not dailyLossHit
+
+longSignal  = readyToTrade and longSignal_raw  and canTakeLong  and trendLongOK_eff  and barstate.isconfirmed
+shortSignal = readyToTrade and shortSignal_raw and canTakeShort and trendShortOK_eff and barstate.isconfirmed
 
 
 // =============================================================================
