@@ -133,6 +133,7 @@ i_showSessionBg   = input.bool(true, "Shade session backgrounds",     group=g_vi
 i_showSLTPBoxes   = input.bool(true, "Draw SL/TP boxes for new trades", group=g_viz)
 i_showEntryArrows = input.bool(true, "Draw entry arrows",              group=g_viz)
 i_showStatsTable  = input.bool(true, "Show backtest analytics table",  group=g_viz)
+i_showDiagPanel   = input.bool(true, "Show diagnostic gate panel (top-left)", group=g_viz, tooltip="Live state of every entry gate. Useful for finding which filter is blocking trades.")
 
 
 // =============================================================================
@@ -161,7 +162,9 @@ inAsiaTest    = i_testMode == "Asia"   and ((nyHour >= 19) or (nyHour <  4))
 inLondonTest  = i_testMode == "London" and (nyHour >= 3 and nyHour < 9)
 inWindow_pre  = (i_useFirstHour and inAM_full) or (i_useSecondHour and inPM_full) or inAsiaTest or inLondonTest
 avoidOpening  = i_avoidFirst3min and isWeekday and nyHour == 9 and nyMin >= 30 and nyMin < 33
-inTradeWindow = (not i_useNYWindow or inWindow_pre) and not avoidOpening
+// In DEBUG mode the NY window restriction is also bypassed so users can verify
+// the structure-break + displacement engine fires anywhere in the backtest.
+inTradeWindow = i_debugMode or ((not i_useNYWindow or inWindow_pre) and not avoidOpening)
 
 // Day reset trigger: the very first bar of an NY day (start of AM session).
 newDay = is0930OpenBar
@@ -603,3 +606,120 @@ if i_showStatsTable and barstate.islast
     table.cell(tbl, 1, 11, str.tostring(pmTrades) + " / " + f_fmt(f_pct(pmWins, pmTrades), 1))
     table.cell(tbl, 0, 12, "Day PnL ($)")
     table.cell(tbl, 1, 12, f_fmt(dailyPnL, 2))
+
+
+// =============================================================================
+//  DIAGNOSTIC GATE PANEL
+//
+//  Real-time status of every entry gate so the user can see WHY trades aren't
+//  firing.  Pass = green, Fail = red.  Updated only on the last bar of the
+//  backtest to keep things cheap.
+// =============================================================================
+
+// Track the most recent bar index a structure event fired on, for the panel.
+var int lastBullBOSBar = -1
+var int lastBearBOSBar = -1
+var int lastBullMSBBar = -1
+var int lastBearMSBBar = -1
+var int lastLongSigBar  = -1
+var int lastShortSigBar = -1
+if bullBOS
+    lastBullBOSBar := bar_index
+if bearBOS
+    lastBearBOSBar := bar_index
+if bullMSB
+    lastBullMSBBar := bar_index
+if bearMSB
+    lastBearMSBBar := bar_index
+if longSignal
+    lastLongSigBar := bar_index
+if shortSignal
+    lastShortSigBar := bar_index
+
+f_yn(bool b) =>
+    b ? "YES" : "no"
+
+f_color(bool ok) =>
+    ok ? color.new(color.green, 70) : color.new(color.red, 70)
+
+f_barsAgo(int b) =>
+    b < 0 ? "n/a" : str.tostring(bar_index - b)
+
+if i_showDiagPanel and barstate.islast
+    var table dtbl = table.new(position.top_left, 2, 24, border_width=1, frame_color=color.gray, frame_width=1)
+    bullDispBA = nz(ta.barssince(bullDisp), 999)
+    bearDispBA = nz(ta.barssince(bearDisp), 999)
+    bullDispRecentNow = bullDisp or (i_dispLookback > 0 and bullDispBA <= i_dispLookback)
+    bearDispRecentNow = bearDisp or (i_dispLookback > 0 and bearDispBA <= i_dispLookback)
+
+    table.cell(dtbl, 0, 0,  "JJ FV NQ - Live Gates",  bgcolor=color.new(color.black, 30), text_color=color.white, text_halign=text.align_left)
+    table.cell(dtbl, 1, 0,  i_debugMode ? "DEBUG ON" : "live",  bgcolor=color.new(i_debugMode ? color.orange : color.black, 30), text_color=color.white)
+
+    table.cell(dtbl, 0, 1,  "Symbol (" + sym + ")")
+    table.cell(dtbl, 1, 1,  f_yn(symbolAllowed),         bgcolor=f_color(symbolAllowed))
+
+    table.cell(dtbl, 0, 2,  "In trade window")
+    table.cell(dtbl, 1, 2,  f_yn(inTradeWindow),         bgcolor=f_color(inTradeWindow))
+
+    table.cell(dtbl, 0, 3,  "FV captured (09:30 / 14:00)")
+    table.cell(dtbl, 1, 3,  (na(fv0930) ? "-" : f_fmt(fv0930, 2)) + " / " + (na(fv1400) ? "-" : f_fmt(fv1400, 2)))
+
+    table.cell(dtbl, 0, 4,  "ATR (>=" + f_fmt(i_minAtrPts, 1) + ")")
+    table.cell(dtbl, 1, 4,  f_fmt(atr, 2),                bgcolor=f_color(minAtrOK))
+
+    table.cell(dtbl, 0, 5,  "Session range (>=" + f_fmt(i_minSessionExp, 1) + ")")
+    table.cell(dtbl, 1, 5,  f_fmt(sessRange, 2),          bgcolor=f_color(sessionExpansionOK))
+
+    table.cell(dtbl, 0, 6,  "Dist from FV")
+    table.cell(dtbl, 1, 6,  f_fmt(distFromFV, 2),         bgcolor=f_color(notInDeadZone))
+
+    table.cell(dtbl, 0, 7,  "Bull disp (last bar)")
+    table.cell(dtbl, 1, 7,  bullDispBA >= 999 ? "never" : str.tostring(bullDispBA), bgcolor=f_color(bullDispRecentNow))
+
+    table.cell(dtbl, 0, 8,  "Bear disp (last bar)")
+    table.cell(dtbl, 1, 8,  bearDispBA >= 999 ? "never" : str.tostring(bearDispBA), bgcolor=f_color(bearDispRecentNow))
+
+    table.cell(dtbl, 0, 9,  "Bull BOS (bars ago)")
+    table.cell(dtbl, 1, 9,  f_barsAgo(lastBullBOSBar),   bgcolor=f_color(lastBullBOSBar >= 0))
+
+    table.cell(dtbl, 0, 10, "Bear BOS (bars ago)")
+    table.cell(dtbl, 1, 10, f_barsAgo(lastBearBOSBar),   bgcolor=f_color(lastBearBOSBar >= 0))
+
+    table.cell(dtbl, 0, 11, "Bull MSB (bars ago)")
+    table.cell(dtbl, 1, 11, f_barsAgo(lastBullMSBBar),   bgcolor=f_color(lastBullMSBBar >= 0))
+
+    table.cell(dtbl, 0, 12, "Bear MSB (bars ago)")
+    table.cell(dtbl, 1, 12, f_barsAgo(lastBearMSBBar),   bgcolor=f_color(lastBearMSBBar >= 0))
+
+    table.cell(dtbl, 0, 13, "Cooldown active")
+    table.cell(dtbl, 1, 13, f_yn(cooldownActive),         bgcolor=f_color(not cooldownActive))
+
+    table.cell(dtbl, 0, 14, "Daily loss hit")
+    table.cell(dtbl, 1, 14, f_yn(dailyLossHit),           bgcolor=f_color(not dailyLossHit))
+
+    table.cell(dtbl, 0, 15, "Long used / Short used")
+    table.cell(dtbl, 1, 15, f_yn(longUsed) + " / " + f_yn(shortUsed))
+
+    table.cell(dtbl, 0, 16, "Trades this session")
+    table.cell(dtbl, 1, 16, str.tostring(sessionTradeCount) + " / " + str.tostring(i_maxTradesPer), bgcolor=f_color(underTradeLimit))
+
+    table.cell(dtbl, 0, 17, "ContLong / ContShort (raw)")
+    table.cell(dtbl, 1, 17, f_yn(contLong) + " / " + f_yn(contShort))
+
+    table.cell(dtbl, 0, 18, "MR Long / MR Short (raw)")
+    table.cell(dtbl, 1, 18, f_yn(mrLong) + " / " + f_yn(mrShort))
+
+    table.cell(dtbl, 0, 19, "Last LONG signal")
+    table.cell(dtbl, 1, 19, f_barsAgo(lastLongSigBar),   bgcolor=f_color(lastLongSigBar >= 0))
+
+    table.cell(dtbl, 0, 20, "Last SHORT signal")
+    table.cell(dtbl, 1, 20, f_barsAgo(lastShortSigBar),  bgcolor=f_color(lastShortSigBar >= 0))
+
+    table.cell(dtbl, 0, 21, "ReadyToTrade")
+    table.cell(dtbl, 1, 21, f_yn(readyToTrade),           bgcolor=f_color(readyToTrade))
+
+    table.cell(dtbl, 0, 22, "Disp lookback (bars)")
+    table.cell(dtbl, 1, 22, str.tostring(i_dispLookback))
+
+    table.cell(dtbl, 0, 23, "Bias (1=bull,-1=bear,0=neut)")
+    table.cell(dtbl, 1, 23, str.tostring(bias))
