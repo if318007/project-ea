@@ -553,7 +553,7 @@ f_fmt(float v, int d) =>
     str.tostring(math.round(v * math.pow(10, d)) / math.pow(10, d))
 
 if i_showStatsTable and barstate.islast
-    var table tbl = table.new(position.top_right, 2, 14, border_width=1)
+    var table tbl = table.new(position.top_right, 2, 13, border_width=1)
     total   = strategy.closedtrades
     wins    = strategy.wintrades
     pf      = strategy.grossloss   == 0 ? na : strategy.grossprofit / strategy.grossloss
