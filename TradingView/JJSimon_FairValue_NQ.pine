@@ -1,0 +1,752 @@
+// =============================================================================
+//  JJ Simon Fair Value Theory - NQ/MNQ 1m New York Session Strategy
+//  Pine Script v6 strategy() implementation focused on funded-account quality.
+//
+//  Concepts implemented:
+//    * Fair Value lines anchored to 09:30 and 14:00 NY opens.
+//    * Continuation setups (away from FV) using bullish/bearish displacement
+//      candle confirmed by a Break of Structure (BOS).
+//    * Mean Reversion setups (extended from FV) using a Market Structure Break
+//      (MSB) plus counter-direction displacement candle.
+//    * ATR-based volatility regime that drives SL/TP in NQ points.
+//    * Optional VWAP confluence, chop filter, trend filter, BE & trail.
+//    * Funded-style risk gating: max trades / session, daily loss cap,
+//      one-direction per session, post-loss cooldown, no pyramiding.
+//
+//  Anti-repaint design:
+//    * Pivots use ta.pivothigh/low with confirmed lookback.
+//    * BOS / MSB only fire on the first candle that closes through a swing
+//      level (uses close[1] vs close transition + barstate.isconfirmed).
+//    * Displacement / entry conditions evaluate on confirmed bars.
+//
+//  Compatible with MT5 EA porting (mechanical conditions, fixed point SL/TP).
+// =============================================================================
+
+//@version=6
+strategy(
+     title                   = "JJ Simon Fair Value NQ/MNQ - v6",
+     shorttitle              = "JJ_FV_NQ",
+     overlay                 = true,
+     initial_capital         = 50000,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     pyramiding              = 0,
+     process_orders_on_close = true,
+     calc_on_every_tick      = false,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 1.5,
+     slippage                = 1,
+     max_lines_count         = 200,
+     max_labels_count        = 500,
+     max_boxes_count         = 200)
+
+
+// =============================================================================
+//  INPUTS
+// =============================================================================
+
+// ---------- Market & Session ------------------------------------------------
+g_market = "1) Market & Session"
+i_strictNQ        = input.bool(true,  "Restrict execution to NQ/MNQ symbols",     group=g_market, tooltip="If enabled, entries are blocked unless the chart symbol contains 'NQ' or 'MNQ'.")
+i_useNYWindow     = input.bool(true,  "Trade only during NY windows",             group=g_market)
+i_useFirstHour    = input.bool(true,  "Use 09:30-11:00 NY window",                group=g_market)
+i_useSecondHour   = input.bool(true,  "Use 14:00-15:00 NY window",                group=g_market)
+i_avoidFirst3min  = input.bool(true,  "Avoid first 3 minutes after 09:30 open",   group=g_market)
+i_testMode        = input.string("Off", "Optional testing session", options=["Off","Asia","London"], group=g_market, tooltip="Adds an extra session window for backtesting.")
+
+// ---------- Fair Value ------------------------------------------------------
+g_fv = "2) Fair Value Lines"
+i_showFV0930      = input.bool(true,  "Show 09:30 NY fair value line",            group=g_fv)
+i_showFV1400      = input.bool(true,  "Show 14:00 NY fair value line",            group=g_fv)
+i_extendFV        = input.bool(true,  "Extend fair value lines right",            group=g_fv)
+i_dynamicColor    = input.bool(true,  "Dynamic colour relative to current price", group=g_fv)
+i_fvColAbove      = input.color(color.new(color.green, 0),  "FV colour: price > FV", group=g_fv)
+i_fvColBelow      = input.color(color.new(color.red, 0),    "FV colour: price < FV", group=g_fv)
+i_fvColNeutral    = input.color(color.gray,                 "FV colour: neutral",    group=g_fv)
+
+// ---------- Market Structure ------------------------------------------------
+g_struct = "3) Market Structure (BOS / MSB)"
+i_pivotLen        = input.int(5,    "Pivot length (left = right)", minval=2, maxval=20, group=g_struct, tooltip="Bars to the left and right used to confirm a swing.")
+i_useCloseBreak   = input.bool(true, "Confirm break on candle close", group=g_struct)
+i_drawSwings      = input.bool(false,"Plot raw swing dots",            group=g_struct)
+i_showBOSLabels   = input.bool(true, "Show BOS labels",                group=g_struct)
+i_showMSBLabels   = input.bool(true, "Show MSB labels",                group=g_struct)
+
+// ---------- Displacement Candle --------------------------------------------
+g_disp = "4) Displacement Candle"
+i_atrLen          = input.int(14,    "ATR length",               minval=2, group=g_disp)
+i_bodyAtrMult     = input.float(0.5, "Min body / ATR multiplier", step=0.1, minval=0.1, group=g_disp, tooltip="On NQ 1m a body equal to ATR is rare. Default 0.5 = body must be at least half of ATR. Tighten to 1.0 for stricter A+ setups.")
+i_maxWickRatio    = input.float(0.35, "Max counter-wick / body ratio", step=0.05, minval=0.0, maxval=1.0, group=g_disp, tooltip="Counter wick is the wick beyond the close (against displacement direction). 0.35 = counter wick may be up to 35% of body. Spec is 0.2 but that almost never fires on 1m.")
+i_minCandleSize   = input.float(0.0, "Minimum candle range (points)", step=0.5, minval=0, group=g_disp)
+i_dispLookback    = input.int(5,    "Displacement lookback (bars)",   minval=0, maxval=20, group=g_disp, tooltip="How many bars back a displacement can be paired with the current BOS/MSB. 0 = same bar only.")
+i_markDisp        = input.bool(true, "Mark displacement candles",   group=g_disp)
+i_highlightDisp   = input.bool(false,"Highlight displacement candle background", group=g_disp)
+
+// ---------- Entry Models ----------------------------------------------------
+g_entry = "5) Entry Models"
+i_useContinuation = input.bool(true, "Enable continuation trades",           group=g_entry)
+i_useMeanRev      = input.bool(true, "Enable mean-reversion trades",         group=g_entry)
+i_minDistContATR  = input.float(0.0, "Continuation: min distance from FV (xATR)", step=0.1, minval=0, group=g_entry)
+i_minMomentumATR  = input.float(0.5, "Continuation: min displacement body (xATR)", step=0.1, minval=0, group=g_entry)
+i_meanRevATRMult  = input.float(1.0, "Mean reversion: min |Price - FV| / ATR", step=0.1, minval=0, group=g_entry)
+i_minExtPts       = input.float(5.0, "Mean reversion: min extension (points)", step=1.0, minval=0, group=g_entry)
+i_debugMode       = input.bool(false,"DEBUG: bypass chop / distance / VWAP / trend filters", group=g_entry, tooltip="Use only to verify the script fires entries on your data. Leave OFF for live trading.")
+
+// ---------- VWAP ------------------------------------------------------------
+g_vwap = "6) VWAP Filter"
+i_useVwap         = input.bool(true,  "Use VWAP as confluence filter",  group=g_vwap)
+i_showVwap        = input.bool(true,  "Plot VWAP line",                 group=g_vwap)
+
+// ---------- ATR Volatility Regime ------------------------------------------
+g_atr = "7) ATR Volatility Regime"
+i_highAtrThr      = input.float(20.0, "High ATR threshold (>)", step=0.5, minval=0, group=g_atr)
+i_lowAtrThr       = input.float(7.0,  "Low ATR threshold (<)",  step=0.5, minval=0, group=g_atr)
+i_slHigh          = input.float(50.0, "SL high regime (points)", step=0.5, group=g_atr)
+i_tpHigh          = input.float(75.0, "TP high regime (points)", step=0.5, group=g_atr)
+i_slMid           = input.float(25.0, "SL mid regime (points)",  step=0.5, group=g_atr)
+i_tpMid           = input.float(37.5, "TP mid regime (points)",  step=0.5, group=g_atr)
+i_slLow           = input.float(16.5, "SL low regime (points)",  step=0.5, group=g_atr)
+i_tpLow           = input.float(24.75,"TP low regime (points)",  step=0.5, group=g_atr)
+i_useFixedRR      = input.bool(false, "Override regime TP with fixed RR", group=g_atr)
+i_fixedRR         = input.float(1.5,  "Fixed RR (TP = SL * RR)", step=0.1, group=g_atr)
+
+// ---------- Risk Management -------------------------------------------------
+g_risk = "8) Risk Management"
+i_maxTradesPer    = input.int(2,      "Max trades per session", minval=1, group=g_risk)
+i_maxDailyLossUSD = input.float(500,  "Max daily loss (USD)",   step=50, minval=0, group=g_risk, tooltip="Soft cap; further trades are blocked once realised PnL for the NY day drops below the negative of this value.")
+i_oneDir          = input.bool(true,  "One trade per direction per session", group=g_risk)
+i_cooldownBars    = input.int(15,     "Cooldown bars after stop-loss",       minval=0, group=g_risk)
+i_useBE           = input.bool(false, "Move SL to break-even at +1R",        group=g_risk)
+i_useTrail        = input.bool(false, "Use trailing stop (off by default)",  group=g_risk)
+i_trailPts        = input.float(15.0, "Trailing stop distance (points)",     step=0.5, group=g_risk)
+
+// ---------- Chop Filter -----------------------------------------------------
+g_chop = "9) Chop Filter"
+i_minAtrPts       = input.float(2.0,  "Minimum ATR (points) to trade",          step=0.5, group=g_chop)
+i_minSessionExp   = input.float(5.0,  "Minimum session range so far (points)",  step=1.0, group=g_chop)
+i_noTradeFVPts    = input.float(0.5,  "No-trade buffer around FV (points)",     step=0.5, group=g_chop)
+i_useTrendFilter  = input.bool(false, "Use 50-EMA slope as trend filter",       group=g_chop)
+
+// ---------- Visualisation ---------------------------------------------------
+g_viz = "10) Visualisation"
+i_showSessionBg   = input.bool(true, "Shade session backgrounds",     group=g_viz)
+i_showSLTPBoxes   = input.bool(true, "Draw SL/TP boxes for new trades", group=g_viz)
+i_showEntryArrows = input.bool(true, "Draw entry arrows",              group=g_viz)
+i_showStatsTable  = input.bool(true, "Show backtest analytics table",  group=g_viz)
+i_showDiagPanel   = input.bool(true, "Show diagnostic gate panel (top-left)", group=g_viz, tooltip="Live state of every entry gate. Useful for finding which filter is blocking trades.")
+
+
+// =============================================================================
+//  TIME, SESSION & SYMBOL HELPERS
+// =============================================================================
+
+// Symbol guard: only trade NQ / MNQ when strict mode is active.
+sym = syminfo.ticker
+isNQfamily = str.contains(sym, "NQ") or str.contains(sym, "MNQ")
+symbolAllowed = not i_strictNQ or isNQfamily
+
+// NY local time on the current bar.
+nyHour   = hour  (time, "America/New_York")
+nyMin    = minute(time, "America/New_York")
+nyDow    = dayofweek(time, "America/New_York")
+isWeekday = nyDow >= 2 and nyDow <= 6
+
+// Open-bar detectors (FV anchors).
+is0930OpenBar = isWeekday and nyHour == 9  and nyMin == 30
+is1400OpenBar = isWeekday and nyHour == 14 and nyMin == 0
+
+// Trading windows (NY local).
+inAM_full     = isWeekday and ((nyHour == 9 and nyMin >= 30) or (nyHour == 10) or (nyHour == 11 and nyMin == 0))
+inPM_full     = isWeekday and ((nyHour == 14) or (nyHour == 15 and nyMin == 0))
+inAsiaTest    = i_testMode == "Asia"   and ((nyHour >= 19) or (nyHour <  4))
+inLondonTest  = i_testMode == "London" and (nyHour >= 3 and nyHour < 9)
+inWindow_pre  = (i_useFirstHour and inAM_full) or (i_useSecondHour and inPM_full) or inAsiaTest or inLondonTest
+avoidOpening  = i_avoidFirst3min and isWeekday and nyHour == 9 and nyMin >= 30 and nyMin < 33
+// In DEBUG mode the NY window restriction is also bypassed so users can verify
+// the structure-break + displacement engine fires anywhere in the backtest.
+inTradeWindow = i_debugMode or ((not i_useNYWindow or inWindow_pre) and not avoidOpening)
+
+// Day reset trigger: the very first bar of an NY day (start of AM session).
+newDay = is0930OpenBar
+
+
+// =============================================================================
+//  FAIR VALUE CAPTURE & DRAWING
+// =============================================================================
+
+var float fv0930 = na
+var float fv1400 = na
+var line  lineFV0930 = na
+var line  lineFV1400 = na
+
+// Capture the open of the 09:30 NY bar.
+if is0930OpenBar
+    fv0930 := open
+    if i_showFV0930
+        if not na(lineFV0930)
+            line.delete(lineFV0930)
+        lineFV0930 := line.new(bar_index, fv0930, bar_index + 1, fv0930,
+                               extend = i_extendFV ? extend.right : extend.none,
+                               color  = i_fvColNeutral,
+                               width  = 2,
+                               style  = line.style_solid)
+
+// Capture the open of the 14:00 NY bar.
+if is1400OpenBar
+    fv1400 := open
+    if i_showFV1400
+        if not na(lineFV1400)
+            line.delete(lineFV1400)
+        lineFV1400 := line.new(bar_index, fv1400, bar_index + 1, fv1400,
+                               extend = i_extendFV ? extend.right : extend.none,
+                               color  = i_fvColNeutral,
+                               width  = 2,
+                               style  = line.style_dashed)
+
+// Dynamic colour update for FV lines.
+fvColor(float fv) =>
+    not i_dynamicColor or na(fv) ? i_fvColNeutral :
+         close > fv ? i_fvColAbove : close < fv ? i_fvColBelow : i_fvColNeutral
+
+if not na(lineFV0930)
+    line.set_color(lineFV0930, fvColor(fv0930))
+if not na(lineFV1400)
+    line.set_color(lineFV1400, fvColor(fv1400))
+
+// Currently relevant fair value (PM uses 14:00 open if present, else 09:30).
+currentFV = inPM_full and not na(fv1400) ? fv1400 : fv0930
+
+
+// =============================================================================
+//  MARKET STRUCTURE: PIVOTS, BOS, MSB
+// =============================================================================
+
+ph = ta.pivothigh(high, i_pivotLen, i_pivotLen)
+pl = ta.pivotlow (low,  i_pivotLen, i_pivotLen)
+
+// Track most recent confirmed swing levels and overall bias.
+var float swingHigh = na
+var float swingLow  = na
+var int   bias      = 0   // +1 bullish, -1 bearish, 0 neutral
+
+if not na(ph)
+    swingHigh := ph
+if not na(pl)
+    swingLow  := pl
+
+// Optional dot markers for the raw swings.
+plotshape(i_drawSwings and not na(ph) ? ph : na, title="Swing High", style=shape.triangledown, location=location.absolute, color=color.new(color.red, 0),  size=size.tiny, offset=-i_pivotLen)
+plotshape(i_drawSwings and not na(pl) ? pl : na, title="Swing Low",  style=shape.triangleup,   location=location.absolute, color=color.new(color.green,0), size=size.tiny, offset=-i_pivotLen)
+
+// Break detection: the first confirmed candle that closes beyond a swing.
+breakUp_raw = not na(swingHigh) and close > swingHigh and close[1] <= swingHigh
+breakDn_raw = not na(swingLow)  and close < swingLow  and close[1] >= swingLow
+
+bullBreak = (i_useCloseBreak ? barstate.isconfirmed : true) and breakUp_raw
+bearBreak = (i_useCloseBreak ? barstate.isconfirmed : true) and breakDn_raw
+
+// Classification (BOS continues the bias, MSB reverses it).
+bullBOS = bullBreak and bias >= 0
+bullMSB = bullBreak and bias <  0
+bearBOS = bearBreak and bias <= 0
+bearMSB = bearBreak and bias >  0
+
+// Update bias and clear consumed swing levels.
+if bullBreak
+    bias      := 1
+    swingHigh := na
+if bearBreak
+    bias      := -1
+    swingLow  := na
+
+// Structure labels.
+if i_showBOSLabels and bullBOS
+    label.new(bar_index, low,  text="BOS",  yloc=yloc.belowbar, color=color.new(color.green, 80), textcolor=color.green, style=label.style_label_up,    size=size.tiny)
+if i_showBOSLabels and bearBOS
+    label.new(bar_index, high, text="BOS",  yloc=yloc.abovebar, color=color.new(color.red,   80), textcolor=color.red,   style=label.style_label_down,  size=size.tiny)
+if i_showMSBLabels and bullMSB
+    label.new(bar_index, low,  text="MSB",  yloc=yloc.belowbar, color=color.new(color.lime,  70), textcolor=color.lime,  style=label.style_label_up,    size=size.small)
+if i_showMSBLabels and bearMSB
+    label.new(bar_index, high, text="MSB",  yloc=yloc.abovebar, color=color.new(color.maroon,70), textcolor=color.maroon,style=label.style_label_down,  size=size.small)
+
+
+// =============================================================================
+//  DISPLACEMENT CANDLE LOGIC
+// =============================================================================
+
+atr        = ta.atr(i_atrLen)
+body       = math.abs(close - open)
+candleRng  = high - low
+upperWick  = high - math.max(close, open)
+lowerWick  = math.min(close, open) - low
+
+// counter wick = wick beyond the close (against the displacement direction)
+counterWickBull = high - close   // bullish: any further up-wick beyond close
+counterWickBear = close - low    // bearish: any further down-wick beyond close
+
+bodyOK   = body >= i_bodyAtrMult * atr
+sizeOK   = candleRng >= i_minCandleSize
+wickBull = body == 0 ? false : counterWickBull / body <= i_maxWickRatio
+wickBear = body == 0 ? false : counterWickBear / body <= i_maxWickRatio
+
+bullDisp = barstate.isconfirmed and close > open and bodyOK and sizeOK and wickBull
+bearDisp = barstate.isconfirmed and close < open and bodyOK and sizeOK and wickBear
+
+// Visuals for displacement candles.
+plotshape(i_markDisp and bullDisp ? low  : na, title="Bull Displacement", style=shape.triangleup,   location=location.belowbar, color=color.new(color.lime, 0),    size=size.tiny)
+plotshape(i_markDisp and bearDisp ? high : na, title="Bear Displacement", style=shape.triangledown, location=location.abovebar, color=color.new(color.fuchsia, 0), size=size.tiny)
+bgcolor(i_highlightDisp and bullDisp ? color.new(color.lime, 90) : i_highlightDisp and bearDisp ? color.new(color.fuchsia, 90) : na)
+
+
+// =============================================================================
+//  VWAP FILTER & TREND FILTER
+// =============================================================================
+
+vwapVal = ta.vwap
+plot(i_showVwap ? vwapVal : na, "VWAP", color=color.new(color.orange, 0), linewidth=1)
+
+ema50  = ta.ema(close, 50)
+emaUp  = ema50 > ema50[3]
+emaDn  = ema50 < ema50[3]
+
+
+// =============================================================================
+//  CHOP / VOLATILITY GATE
+// =============================================================================
+
+// Track the running session range (high - low since session start).
+var float sessHigh = na
+var float sessLow  = na
+sessReset = is0930OpenBar or is1400OpenBar
+if sessReset
+    sessHigh := high
+    sessLow  := low
+else
+    if not na(sessHigh)
+        sessHigh := math.max(sessHigh, high)
+    if not na(sessLow)
+        sessLow  := math.min(sessLow,  low)
+sessRange   = na(sessHigh) or na(sessLow) ? 0.0 : sessHigh - sessLow
+
+minAtrOK    = atr >= i_minAtrPts
+sessionExpansionOK = sessRange >= i_minSessionExp
+notInDeadZone     = na(currentFV) ? true : math.abs(close - currentFV) >= i_noTradeFVPts
+trendFilterLong   = not i_useTrendFilter or emaUp
+trendFilterShort  = not i_useTrendFilter or emaDn
+
+chopGate = minAtrOK and sessionExpansionOK and notInDeadZone
+
+
+// =============================================================================
+//  ATR REGIME -> SL / TP IN POINTS
+// =============================================================================
+
+regimeSL() =>
+    atr > i_highAtrThr ? i_slHigh : atr < i_lowAtrThr ? i_slLow : i_slMid
+
+regimeTP() =>
+    atr > i_highAtrThr ? i_tpHigh : atr < i_lowAtrThr ? i_tpLow : i_tpMid
+
+slPts = regimeSL()
+tpPts = i_useFixedRR ? slPts * i_fixedRR : regimeTP()
+
+
+// =============================================================================
+//  RISK / SESSION STATE
+// =============================================================================
+
+var int   sessionTradeCount = 0
+var bool  longUsed           = false   // long already taken this session
+var bool  shortUsed          = false   // short already taken this session
+var int   cooldownEndBar     = 0
+var float dailyPnL           = 0.0
+var int   curDayId           = -1
+var int   prevClosed         = 0
+
+// Session reset handling.
+if sessReset
+    sessionTradeCount := 0
+    longUsed          := false
+    shortUsed         := false
+
+// Daily reset (use NY date).
+nyDayId = year(time, "America/New_York") * 10000 + month(time, "America/New_York") * 100 + dayofmonth(time, "America/New_York")
+if nyDayId != curDayId
+    curDayId := nyDayId
+    dailyPnL := 0.0
+
+// Track newly closed trades to update PnL & cooldown.
+nClosed = strategy.closedtrades
+if nClosed > prevClosed
+    for i = prevClosed to nClosed - 1
+        p = strategy.closedtrades.profit(i)
+        dailyPnL := dailyPnL + p
+        if p < 0
+            cooldownEndBar := bar_index + i_cooldownBars
+prevClosed := nClosed
+
+cooldownActive   = bar_index < cooldownEndBar
+dailyLossHit     = i_maxDailyLossUSD > 0 and dailyPnL <= -i_maxDailyLossUSD
+canTakeLong      = not i_oneDir or not longUsed
+canTakeShort     = not i_oneDir or not shortUsed
+underTradeLimit  = sessionTradeCount < i_maxTradesPer
+flat             = strategy.position_size == 0
+
+
+// =============================================================================
+//  ENTRY CONDITIONS
+// =============================================================================
+
+distFromFV = na(currentFV) ? 0.0 : close - currentFV
+
+// Allow displacement to occur up to N bars before BOS/MSB (per JJ Simon spec the
+// displacement and the structure break are usually consecutive but not always
+// the same candle).  ta.barssince returns na if the condition was never true,
+// so guard with nz(..., 999).
+bullDispRecent = bullDisp or (i_dispLookback > 0 and nz(ta.barssince(bullDisp), 999) <= i_dispLookback)
+bearDispRecent = bearDisp or (i_dispLookback > 0 and nz(ta.barssince(bearDisp), 999) <= i_dispLookback)
+
+// --- Continuation: trend continues away from fair value ---
+contDistFarLong   = i_debugMode or distFromFV  > i_minDistContATR * atr
+contDistFarShort  = i_debugMode or -distFromFV > i_minDistContATR * atr
+contMomentumOK    = i_debugMode or body >= i_minMomentumATR * atr
+contVwapLongOK    = i_debugMode or not i_useVwap or close > vwapVal
+contVwapShortOK   = i_debugMode or not i_useVwap or close < vwapVal
+
+contLong  = i_useContinuation and bullBOS and bullDispRecent and not na(currentFV) and contDistFarLong  and contMomentumOK and contVwapLongOK
+contShort = i_useContinuation and bearBOS and bearDispRecent and not na(currentFV) and contDistFarShort and contMomentumOK and contVwapShortOK
+
+// --- Mean reversion: extended from FV, MSB confirms reversal ---
+mrExtAboveATR   = i_debugMode or distFromFV  > i_meanRevATRMult * atr
+mrExtBelowATR   = i_debugMode or -distFromFV > i_meanRevATRMult * atr
+mrExtAbovePts   = i_debugMode or distFromFV  > i_minExtPts
+mrExtBelowPts   = i_debugMode or -distFromFV > i_minExtPts
+mrVwapLongOK    = i_debugMode or not i_useVwap or close >= vwapVal or close >= ta.lowest(low, 3)
+mrVwapShortOK   = i_debugMode or not i_useVwap or close <= vwapVal or close <= ta.highest(high, 3)
+
+mrLong  = i_useMeanRev and bullMSB and bullDispRecent and not na(currentFV) and mrExtBelowATR and mrExtBelowPts and mrVwapLongOK
+mrShort = i_useMeanRev and bearMSB and bearDispRecent and not na(currentFV) and mrExtAboveATR and mrExtAbovePts and mrVwapShortOK
+
+// --- Combine into final long/short signals & gating ---
+longSignal_raw  = contLong  or mrLong
+shortSignal_raw = contShort or mrShort
+
+// Chop / trend filters are also bypassed in debug mode so the user can see
+// raw setup frequency.
+chopOK_eff       = i_debugMode or chopGate
+trendLongOK_eff  = i_debugMode or trendFilterLong
+trendShortOK_eff = i_debugMode or trendFilterShort
+
+readyToTrade = symbolAllowed and inTradeWindow and chopOK_eff and flat and underTradeLimit and not cooldownActive and not dailyLossHit
+
+longSignal  = readyToTrade and longSignal_raw  and canTakeLong  and trendLongOK_eff  and barstate.isconfirmed
+shortSignal = readyToTrade and shortSignal_raw and canTakeShort and trendShortOK_eff and barstate.isconfirmed
+
+
+// =============================================================================
+//  ORDER PLACEMENT
+// =============================================================================
+
+// Order placement is inlined to keep it Pine v6-friendly (no tuple returns).
+// box.new convention: top must be the higher price, bottom the lower price.
+if longSignal
+    kindL  = contLong ? "CONT" : "MR"
+    entryL = close
+    slL    = entryL - slPts
+    tpL    = entryL + tpPts
+    tagL   = "L_" + kindL
+    strategy.entry(tagL, strategy.long, comment=kindL)
+    if i_useTrail and i_trailPts > 0
+        strategy.exit("X_" + tagL, from_entry=tagL, stop=slL, limit=tpL, trail_points=i_trailPts, trail_offset=i_trailPts)
+    else
+        strategy.exit("X_" + tagL, from_entry=tagL, stop=slL, limit=tpL)
+    if i_showSLTPBoxes
+        // SL zone: from entry (top) down to slL (bottom)
+        box.new(bar_index, entryL, bar_index + 30, slL,    bgcolor=color.new(color.red,   85), border_color=color.new(color.red,   60))
+        // TP zone: from tpL (top) down to entry (bottom)
+        box.new(bar_index, tpL,    bar_index + 30, entryL, bgcolor=color.new(color.green, 85), border_color=color.new(color.green, 60))
+    sessionTradeCount := sessionTradeCount + 1
+    longUsed          := true
+
+if shortSignal
+    kindS  = contShort ? "CONT" : "MR"
+    entryS = close
+    slS    = entryS + slPts
+    tpS    = entryS - tpPts
+    tagS   = "S_" + kindS
+    strategy.entry(tagS, strategy.short, comment=kindS)
+    if i_useTrail and i_trailPts > 0
+        strategy.exit("X_" + tagS, from_entry=tagS, stop=slS, limit=tpS, trail_points=i_trailPts, trail_offset=i_trailPts)
+    else
+        strategy.exit("X_" + tagS, from_entry=tagS, stop=slS, limit=tpS)
+    if i_showSLTPBoxes
+        // SL zone: from slS (top) down to entry (bottom)
+        box.new(bar_index, slS,    bar_index + 30, entryS, bgcolor=color.new(color.red,   85), border_color=color.new(color.red,   60))
+        // TP zone: from entry (top) down to tpS (bottom)
+        box.new(bar_index, entryS, bar_index + 30, tpS,    bgcolor=color.new(color.green, 85), border_color=color.new(color.green, 60))
+    sessionTradeCount := sessionTradeCount + 1
+    shortUsed         := true
+
+// Optional break-even logic (move SL to entry once price reaches +1R).
+if i_useBE and strategy.position_size != 0
+    avg = strategy.position_avg_price
+    if strategy.position_size > 0 and high >= avg + slPts
+        strategy.exit("BE_L", stop=avg)
+    if strategy.position_size < 0 and low  <= avg - slPts
+        strategy.exit("BE_S", stop=avg)
+
+
+// =============================================================================
+//  VISUAL EXTRAS
+// =============================================================================
+
+bgcolor(i_showSessionBg and inAM_full and i_useFirstHour  ? color.new(color.blue,   92) : na, title="AM session")
+bgcolor(i_showSessionBg and inPM_full and i_useSecondHour ? color.new(color.purple, 92) : na, title="PM session")
+
+plotshape(i_showEntryArrows and longSignal  ? low  : na, title="Buy arrow",  style=shape.triangleup,   location=location.belowbar, color=color.new(color.green, 0), size=size.small)
+plotshape(i_showEntryArrows and shortSignal ? high : na, title="Sell arrow", style=shape.triangledown, location=location.abovebar, color=color.new(color.red,   0), size=size.small)
+
+
+// =============================================================================
+//  ALERTS
+// =============================================================================
+
+alertcondition(bullBOS,                "Bullish BOS",                 "Bullish BOS on {{ticker}} {{interval}}")
+alertcondition(bearBOS,                "Bearish BOS",                 "Bearish BOS on {{ticker}} {{interval}}")
+alertcondition(bullMSB,                "Bullish MSB",                 "Bullish MSB on {{ticker}} {{interval}}")
+alertcondition(bearMSB,                "Bearish MSB",                 "Bearish MSB on {{ticker}} {{interval}}")
+alertcondition(bullDisp or bearDisp,   "Displacement Candle",         "Displacement candle on {{ticker}} {{interval}}")
+alertcondition(contLong or contShort,  "Continuation Setup",          "Continuation setup on {{ticker}} {{interval}}")
+alertcondition(mrLong or mrShort,      "Mean Reversion Setup",        "Mean reversion setup on {{ticker}} {{interval}}")
+alertcondition(longSignal,             "Buy Signal",                  "Buy signal {{ticker}} {{interval}} @ {{close}}")
+alertcondition(shortSignal,            "Sell Signal",                 "Sell signal {{ticker}} {{interval}} @ {{close}}")
+
+
+// =============================================================================
+//  BACKTEST ANALYTICS TABLE
+// =============================================================================
+
+// Track per-bucket wins/losses based on the entry comment.
+var int totContTrades = 0
+var int totMRTrades   = 0
+var int winCont       = 0
+var int winMR         = 0
+var int amTrades      = 0
+var int pmTrades      = 0
+var int amWins        = 0
+var int pmWins        = 0
+var int stat_prevClosed = 0
+
+if strategy.closedtrades > stat_prevClosed
+    for k = stat_prevClosed to strategy.closedtrades - 1
+        cmt   = strategy.closedtrades.entry_comment(k)
+        prof  = strategy.closedtrades.profit(k)
+        eTime = strategy.closedtrades.entry_time(k)
+        eHour = hour(eTime,   "America/New_York")
+        eMin  = minute(eTime, "America/New_York")
+        isAM  = (eHour == 9 and eMin >= 30) or eHour == 10 or (eHour == 11 and eMin == 0)
+        isPM  = eHour == 14 or (eHour == 15 and eMin == 0)
+        if cmt == "CONT"
+            totContTrades := totContTrades + 1
+            if prof > 0
+                winCont := winCont + 1
+        if cmt == "MR"
+            totMRTrades := totMRTrades + 1
+            if prof > 0
+                winMR := winMR + 1
+        if isAM
+            amTrades := amTrades + 1
+            if prof > 0
+                amWins := amWins + 1
+        if isPM
+            pmTrades := pmTrades + 1
+            if prof > 0
+                pmWins := pmWins + 1
+stat_prevClosed := strategy.closedtrades
+
+f_pct(int wins, int total) =>
+    total == 0 ? 0.0 : 100.0 * wins / total
+
+f_fmt(float v, int d) =>
+    str.tostring(math.round(v * math.pow(10, d)) / math.pow(10, d))
+
+if i_showStatsTable and barstate.islast
+    var table tbl = table.new(position.top_right, 2, 13, border_width=1)
+    total   = strategy.closedtrades
+    wins    = strategy.wintrades
+    pf      = strategy.grossloss   == 0 ? na : strategy.grossprofit / strategy.grossloss
+    avgWin  = strategy.wintrades   == 0 ? 0.0 : strategy.grossprofit / strategy.wintrades
+    avgLoss = strategy.losstrades  == 0 ? 0.0 : strategy.grossloss   / strategy.losstrades
+    avgRR   = avgLoss == 0 ? na : avgWin / avgLoss
+    expect  = total == 0 ? 0.0 : strategy.netprofit / total
+
+    table.cell(tbl, 0, 0,  "JJ FV NQ - Stats",       bgcolor=color.new(color.black, 50), text_color=color.white, text_halign=text.align_left)
+    table.cell(tbl, 1, 0,  "",                        bgcolor=color.new(color.black, 50))
+    table.cell(tbl, 0, 1,  "Total Trades")
+    table.cell(tbl, 1, 1,  str.tostring(total))
+    table.cell(tbl, 0, 2,  "Win Rate %")
+    table.cell(tbl, 1, 2,  f_fmt(f_pct(wins, total), 2))
+    table.cell(tbl, 0, 3,  "Profit Factor")
+    table.cell(tbl, 1, 3,  na(pf) ? "n/a" : f_fmt(pf, 2))
+    table.cell(tbl, 0, 4,  "Avg RR (W/L)")
+    table.cell(tbl, 1, 4,  na(avgRR) ? "n/a" : f_fmt(avgRR, 2))
+    table.cell(tbl, 0, 5,  "Expectancy ($)")
+    table.cell(tbl, 1, 5,  f_fmt(expect, 2))
+    table.cell(tbl, 0, 6,  "Max DD ($)")
+    table.cell(tbl, 1, 6,  f_fmt(strategy.max_drawdown, 2))
+    table.cell(tbl, 0, 7,  "Net PnL ($)")
+    table.cell(tbl, 1, 7,  f_fmt(strategy.netprofit, 2))
+    table.cell(tbl, 0, 8,  "Continuation T / Win%")
+    table.cell(tbl, 1, 8,  str.tostring(totContTrades) + " / " + f_fmt(f_pct(winCont, totContTrades), 1))
+    table.cell(tbl, 0, 9,  "Mean Rev T / Win%")
+    table.cell(tbl, 1, 9,  str.tostring(totMRTrades)   + " / " + f_fmt(f_pct(winMR,   totMRTrades),   1))
+    table.cell(tbl, 0, 10, "AM (09:30-11:00) T / Win%")
+    table.cell(tbl, 1, 10, str.tostring(amTrades) + " / " + f_fmt(f_pct(amWins, amTrades), 1))
+    table.cell(tbl, 0, 11, "PM (14:00-15:00) T / Win%")
+    table.cell(tbl, 1, 11, str.tostring(pmTrades) + " / " + f_fmt(f_pct(pmWins, pmTrades), 1))
+    table.cell(tbl, 0, 12, "Day PnL ($)")
+    table.cell(tbl, 1, 12, f_fmt(dailyPnL, 2))
+
+
+// =============================================================================
+//  DIAGNOSTIC GATE PANEL
+//
+//  Real-time status of every entry gate so the user can see WHY trades aren't
+//  firing.  Pass = green, Fail = red.  Updated only on the last bar of the
+//  backtest to keep things cheap.
+// =============================================================================
+
+// Track event counters and most-recent-bar at global scope so state is correct
+// even when the panel is only drawn on the last bar.  ta.barssince must also
+// be evaluated at global scope for proper state tracking in Pine v6.
+var int cnt_bullDisp     = 0
+var int cnt_bearDisp     = 0
+var int cnt_bullBOS      = 0
+var int cnt_bearBOS      = 0
+var int cnt_bullMSB      = 0
+var int cnt_bearMSB      = 0
+var int cnt_contLong     = 0
+var int cnt_contShort    = 0
+var int cnt_mrLong       = 0
+var int cnt_mrShort      = 0
+var int cnt_longSignal   = 0
+var int cnt_shortSignal  = 0
+var int lastBullBOSBar   = -1
+var int lastBearBOSBar   = -1
+var int lastBullMSBBar   = -1
+var int lastBearMSBBar   = -1
+var int lastLongSigBar   = -1
+var int lastShortSigBar  = -1
+
+if bullDisp
+    cnt_bullDisp     := cnt_bullDisp + 1
+if bearDisp
+    cnt_bearDisp     := cnt_bearDisp + 1
+if bullBOS
+    cnt_bullBOS      := cnt_bullBOS + 1
+    lastBullBOSBar   := bar_index
+if bearBOS
+    cnt_bearBOS      := cnt_bearBOS + 1
+    lastBearBOSBar   := bar_index
+if bullMSB
+    cnt_bullMSB      := cnt_bullMSB + 1
+    lastBullMSBBar   := bar_index
+if bearMSB
+    cnt_bearMSB      := cnt_bearMSB + 1
+    lastBearMSBBar   := bar_index
+if contLong
+    cnt_contLong     := cnt_contLong + 1
+if contShort
+    cnt_contShort    := cnt_contShort + 1
+if mrLong
+    cnt_mrLong       := cnt_mrLong + 1
+if mrShort
+    cnt_mrShort      := cnt_mrShort + 1
+if longSignal
+    cnt_longSignal   := cnt_longSignal + 1
+    lastLongSigBar   := bar_index
+if shortSignal
+    cnt_shortSignal  := cnt_shortSignal + 1
+    lastShortSigBar  := bar_index
+
+// Evaluate ta.barssince at GLOBAL scope so its internal state tracks every bar.
+bullDispBA_g = nz(ta.barssince(bullDisp), 999)
+bearDispBA_g = nz(ta.barssince(bearDisp), 999)
+
+f_yn(bool b) =>
+    b ? "YES" : "no"
+
+f_color(bool ok) =>
+    ok ? color.new(color.green, 70) : color.new(color.red, 70)
+
+f_barsAgo(int b) =>
+    b < 0 ? "n/a" : str.tostring(bar_index - b)
+
+if i_showDiagPanel and barstate.islast
+    var table dtbl = table.new(position.top_left, 2, 22, border_width=1, frame_color=color.gray, frame_width=1)
+
+    table.cell(dtbl, 0, 0,  "JJ FV NQ - Live Gates",  bgcolor=color.new(color.black, 30), text_color=color.white, text_halign=text.align_left)
+    table.cell(dtbl, 1, 0,  i_debugMode ? "DEBUG ON" : "live",  bgcolor=color.new(i_debugMode ? color.orange : color.black, 30), text_color=color.white)
+
+    table.cell(dtbl, 0, 1,  "Symbol (" + sym + ")")
+    table.cell(dtbl, 1, 1,  f_yn(symbolAllowed),         bgcolor=f_color(symbolAllowed))
+
+    table.cell(dtbl, 0, 2,  "In trade window")
+    table.cell(dtbl, 1, 2,  f_yn(inTradeWindow),         bgcolor=f_color(inTradeWindow))
+
+    table.cell(dtbl, 0, 3,  "FV captured (09:30 / 14:00)")
+    table.cell(dtbl, 1, 3,  (na(fv0930) ? "-" : f_fmt(fv0930, 2)) + " / " + (na(fv1400) ? "-" : f_fmt(fv1400, 2)))
+
+    table.cell(dtbl, 0, 4,  "ATR (>=" + f_fmt(i_minAtrPts, 1) + ")")
+    table.cell(dtbl, 1, 4,  f_fmt(atr, 2),                bgcolor=f_color(minAtrOK))
+
+    table.cell(dtbl, 0, 5,  "Session range (>=" + f_fmt(i_minSessionExp, 1) + ")")
+    table.cell(dtbl, 1, 5,  f_fmt(sessRange, 2),          bgcolor=f_color(sessionExpansionOK))
+
+    table.cell(dtbl, 0, 6,  "Dist from FV")
+    table.cell(dtbl, 1, 6,  f_fmt(distFromFV, 2),         bgcolor=f_color(notInDeadZone))
+
+    table.cell(dtbl, 0, 7,  "Bull disp count / last bar")
+    table.cell(dtbl, 1, 7,  str.tostring(cnt_bullDisp) + " / " + (bullDispBA_g >= 999 ? "never" : str.tostring(bullDispBA_g)), bgcolor=f_color(cnt_bullDisp > 0))
+
+    table.cell(dtbl, 0, 8,  "Bear disp count / last bar")
+    table.cell(dtbl, 1, 8,  str.tostring(cnt_bearDisp) + " / " + (bearDispBA_g >= 999 ? "never" : str.tostring(bearDispBA_g)), bgcolor=f_color(cnt_bearDisp > 0))
+
+    table.cell(dtbl, 0, 9,  "Bull BOS / Bear BOS count")
+    table.cell(dtbl, 1, 9,  str.tostring(cnt_bullBOS) + " / " + str.tostring(cnt_bearBOS), bgcolor=f_color(cnt_bullBOS + cnt_bearBOS > 0))
+
+    table.cell(dtbl, 0, 10, "Bull MSB / Bear MSB count")
+    table.cell(dtbl, 1, 10, str.tostring(cnt_bullMSB) + " / " + str.tostring(cnt_bearMSB), bgcolor=f_color(cnt_bullMSB + cnt_bearMSB > 0))
+
+    table.cell(dtbl, 0, 11, "ContLong / ContShort count")
+    table.cell(dtbl, 1, 11, str.tostring(cnt_contLong) + " / " + str.tostring(cnt_contShort), bgcolor=f_color(cnt_contLong + cnt_contShort > 0))
+
+    table.cell(dtbl, 0, 12, "MR Long / MR Short count")
+    table.cell(dtbl, 1, 12, str.tostring(cnt_mrLong) + " / " + str.tostring(cnt_mrShort), bgcolor=f_color(cnt_mrLong + cnt_mrShort > 0))
+
+    table.cell(dtbl, 0, 13, "LONG / SHORT signal count")
+    table.cell(dtbl, 1, 13, str.tostring(cnt_longSignal) + " / " + str.tostring(cnt_shortSignal), bgcolor=f_color(cnt_longSignal + cnt_shortSignal > 0))
+
+    table.cell(dtbl, 0, 14, "Closed trades")
+    table.cell(dtbl, 1, 14, str.tostring(strategy.closedtrades), bgcolor=f_color(strategy.closedtrades > 0))
+
+    table.cell(dtbl, 0, 15, "Cooldown / DailyLossHit")
+    table.cell(dtbl, 1, 15, f_yn(cooldownActive) + " / " + f_yn(dailyLossHit), bgcolor=f_color(not cooldownActive and not dailyLossHit))
+
+    table.cell(dtbl, 0, 16, "Long used / Short used")
+    table.cell(dtbl, 1, 16, f_yn(longUsed) + " / " + f_yn(shortUsed))
+
+    table.cell(dtbl, 0, 17, "Trades this session / cap")
+    table.cell(dtbl, 1, 17, str.tostring(sessionTradeCount) + " / " + str.tostring(i_maxTradesPer), bgcolor=f_color(underTradeLimit))
+
+    table.cell(dtbl, 0, 18, "Last LONG / SHORT signal bar")
+    table.cell(dtbl, 1, 18, f_barsAgo(lastLongSigBar) + " / " + f_barsAgo(lastShortSigBar))
+
+    table.cell(dtbl, 0, 19, "ReadyToTrade")
+    table.cell(dtbl, 1, 19, f_yn(readyToTrade),           bgcolor=f_color(readyToTrade))
+
+    table.cell(dtbl, 0, 20, "Disp lookback / Bias")
+    table.cell(dtbl, 1, 20, str.tostring(i_dispLookback) + " / " + str.tostring(bias))
+
+    table.cell(dtbl, 0, 21, "Position size / avg")
+    table.cell(dtbl, 1, 21, str.tostring(strategy.position_size) + " @ " + (strategy.position_size == 0 ? "-" : f_fmt(strategy.position_avg_price, 2)))
